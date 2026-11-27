@@ -13,6 +13,8 @@ import com.google.gson.Gson;
 import com.google.inject.Provides;
 import java.awt.image.BufferedImage;
 import java.util.Collections;
+import java.util.EnumMap;
+import java.util.EnumSet;
 import java.util.HashMap;
 import java.util.HashSet;
 import java.util.Map;
@@ -32,6 +34,7 @@ import net.runelite.api.ItemComposition;
 import net.runelite.api.ItemContainer;
 import net.runelite.api.NPC;
 import net.runelite.api.Player;
+import net.runelite.api.Skill;
 import net.runelite.api.coords.WorldPoint;
 import net.runelite.api.events.ActorDeath;
 import net.runelite.api.events.GameStateChanged;
@@ -40,17 +43,21 @@ import net.runelite.api.events.HitsplatApplied;
 import net.runelite.api.events.ItemContainerChanged;
 import net.runelite.api.events.ItemSpawned;
 import net.runelite.api.events.MenuOptionClicked;
+import net.runelite.api.events.StatChanged;
 import net.runelite.api.events.VarbitChanged;
 import net.runelite.api.gameval.InterfaceID;
 import net.runelite.api.gameval.InventoryID;
 import net.runelite.api.gameval.ItemID;
+import net.runelite.api.gameval.VarPlayerID;
 import net.runelite.api.gameval.VarbitID;
 import net.runelite.api.widgets.Widget;
 import net.runelite.client.callback.ClientThread;
 import net.runelite.client.config.ConfigManager;
 import net.runelite.client.eventbus.Subscribe;
 import net.runelite.client.events.ConfigChanged;
+import net.runelite.client.events.NpcLootReceived;
 import net.runelite.client.game.ItemManager;
+import net.runelite.client.game.ItemStack;
 import net.runelite.client.plugins.Plugin;
 import net.runelite.client.plugins.PluginDescriptor;
 import net.runelite.client.ui.ClientToolbar;
@@ -60,12 +67,22 @@ import net.runelite.client.util.ImageUtil;
 
 @PluginDescriptor(
 	name = "Combat Breakdown",
-	description = "Live active & session DPS, hit distribution, per-weapon comparison, damage taken, supply burn rate, and per-target fight history",
-	tags = {"combat", "dps", "pvm", "bossing", "slayer", "analytics", "meter", "accuracy", "supplies", "history"}
+	description = "Live active & session DPS, sparkline, hit distribution, per-weapon and A/B comparisons, spec & XP/hr, loot vs. supply burn, and per-target fight history",
+	tags = {"combat", "dps", "pvm", "bossing", "slayer", "analytics", "meter", "accuracy", "supplies", "profit", "history"}
 )
 public class CombatBreakdownPlugin extends Plugin
 {
 	private static final String KEY_TARGET_HISTORY = "targetHistoryJson";
+
+	private static final Set<Skill> TRACKED_COMBAT_SKILLS = EnumSet.of(
+		Skill.ATTACK,
+		Skill.STRENGTH,
+		Skill.DEFENCE,
+		Skill.RANGED,
+		Skill.MAGIC,
+		Skill.HITPOINTS,
+		Skill.SLAYER
+	);
 
 	private static final int[] RUNE_POUCH_TYPE_VARBITS = {
 		VarbitID.RUNE_POUCH_TYPE_1,
@@ -133,6 +150,9 @@ public class CombatBreakdownPlugin extends Plugin
 
 	private final CombatSessionTracker sessionTracker = new CombatSessionTracker();
 	private final SupplyBurnTracker supplyTracker = new SupplyBurnTracker();
+	private final Map<Skill, Integer> lastSkillXp = new EnumMap<>(Skill.class);
+	private int lastSpecEnergy = -1;
+
 	private HistorySerializer historySerializer;
 	private NavigationButton navButton;
 	private CombatBreakdownPanel panel;
@@ -217,7 +237,10 @@ public class CombatBreakdownPlugin extends Plugin
 		synchronized (this)
 		{
 			sessionTracker.resetSessionOnly();
+			sessionTracker.clearPinnedComparison();
 			supplyTracker.reset();
+			lastSkillXp.clear();
+			lastSpecEnergy = -1;
 		}
 		latestSession = null;
 		latestBurn = null;
@@ -234,6 +257,8 @@ public class CombatBreakdownPlugin extends Plugin
 			synchronized (this)
 			{
 				supplyTracker.invalidateBaseline();
+				lastSkillXp.clear();
+				lastSpecEnergy = -1;
 			}
 		}
 		else if (state == GameState.LOGGED_IN)
@@ -255,6 +280,58 @@ public class CombatBreakdownPlugin extends Plugin
 		}
 		publishSnapshots();
 		notifyPanel();
+	}
+
+	@Subscribe
+	public void onStatChanged(StatChanged event)
+	{
+		Skill skill = event.getSkill();
+		if (!TRACKED_COMBAT_SKILLS.contains(skill))
+		{
+			return;
+		}
+		int newXp = event.getXp();
+		synchronized (this)
+		{
+			Integer prev = lastSkillXp.put(skill, newXp);
+			if (prev != null && newXp > prev)
+			{
+				sessionTracker.recordSkillXp(skill, newXp - prev);
+				panelDirty = true;
+			}
+		}
+	}
+
+	@Subscribe
+	public void onNpcLootReceived(NpcLootReceived event)
+	{
+		if (event.getNpc() == null || event.getItems() == null || event.getItems().isEmpty())
+		{
+			return;
+		}
+		long totalDropGp = 0L;
+		synchronized (this)
+		{
+			for (ItemStack stack : event.getItems())
+			{
+				if (stack == null || stack.getId() <= 0 || stack.getQuantity() <= 0)
+				{
+					continue;
+				}
+				int canonicalId = itemManager.canonicalize(stack.getId());
+				totalDropGp += supplyTracker.recordLootDrop(canonicalId, stack.getQuantity(), itemMetaLookup);
+			}
+			if (totalDropGp > 0)
+			{
+				sessionTracker.recordNpcLootValue(event.getNpc().getName(), totalDropGp);
+				if (config.persistTargetHistory())
+				{
+					persistHistoryLocked();
+				}
+			}
+		}
+		publishSnapshots();
+		panelDirty = true;
 	}
 
 	@Subscribe
@@ -405,6 +482,19 @@ public class CombatBreakdownPlugin extends Plugin
 			ironmanAccount = client.getVarbitValue(VarbitID.IRONMAN) != 0;
 			panelDirty = true;
 		}
+		else if (event.getVarpId() == VarPlayerID.SA_ENERGY)
+		{
+			int nowSpec = client.getVarpValue(VarPlayerID.SA_ENERGY);
+			synchronized (this)
+			{
+				if (lastSpecEnergy >= 0 && nowSpec < lastSpecEnergy)
+				{
+					sessionTracker.recordSpecialAttackUsed(client.getTickCount());
+					panelDirty = true;
+				}
+				lastSpecEnergy = nowSpec;
+			}
+		}
 		else if (config.trackSupplyBurn() && RUNE_POUCH_VARBITS.contains(varbit))
 		{
 			processSupplyDeltaOnClientThread();
@@ -454,6 +544,35 @@ public class CombatBreakdownPlugin extends Plugin
 		notifyPanel();
 	}
 
+	public void pinCurrentRunAndReset()
+	{
+		synchronized (this)
+		{
+			SessionSnapshot s = sessionTracker.snapshot();
+			if (!s.isSessionStarted())
+			{
+				return;
+			}
+			BurnSnapshot b = supplyTracker.snapshot(s.getSessionSeconds(), s.getSessionKills());
+			sessionTracker.pinCurrentComparison(b.getGpPerHour(), b.getNetProfitPerHour());
+			sessionTracker.resetSessionOnly();
+			supplyTracker.reset();
+		}
+		publishSnapshots();
+		notifyPanel();
+		clientThread.invokeLater(this::syncAccountAndEquipmentOnClientThread);
+	}
+
+	public void unpinComparison()
+	{
+		synchronized (this)
+		{
+			sessionTracker.clearPinnedComparison();
+		}
+		publishSnapshots();
+		notifyPanel();
+	}
+
 	public void resetSession()
 	{
 		synchronized (this)
@@ -483,7 +602,7 @@ public class CombatBreakdownPlugin extends Plugin
 		{
 			SessionSnapshot s = sessionTracker.snapshot();
 			BurnSnapshot b = supplyTracker.snapshot(s.getSessionSeconds(), s.getSessionKills());
-			return sessionTracker.formatSummaryText(b.getTotalCostGp(), shouldDisplayGpValues());
+			return sessionTracker.formatSummaryText(b.getTotalCostGp(), b.getTotalLootGp(), shouldDisplayGpValues());
 		}
 	}
 
@@ -502,6 +621,14 @@ public class CombatBreakdownPlugin extends Plugin
 			return;
 		}
 		ironmanAccount = client.getVarbitValue(VarbitID.IRONMAN) != 0;
+		synchronized (this)
+		{
+			lastSpecEnergy = client.getVarpValue(VarPlayerID.SA_ENERGY);
+			for (Skill skill : TRACKED_COMBAT_SKILLS)
+			{
+				lastSkillXp.put(skill, client.getSkillExperience(skill));
+			}
+		}
 		syncWeaponOnClientThread();
 		if (config.trackSupplyBurn())
 		{

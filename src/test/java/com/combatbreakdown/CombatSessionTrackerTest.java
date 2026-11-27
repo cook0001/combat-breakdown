@@ -7,6 +7,7 @@ import com.combatbreakdown.logic.HitsplatClassifier;
 import com.combatbreakdown.model.FightRecord;
 import com.combatbreakdown.model.HitCategory;
 import com.combatbreakdown.model.HitDistribution;
+import com.combatbreakdown.model.PinnedComparison;
 import com.combatbreakdown.model.TargetSummary;
 import com.combatbreakdown.model.WeaponStats;
 import java.awt.image.BufferedImage;
@@ -15,6 +16,7 @@ import java.io.IOException;
 import java.util.List;
 import javax.imageio.ImageIO;
 import net.runelite.api.HitsplatID;
+import net.runelite.api.Skill;
 import net.runelite.api.gameval.ItemID;
 import net.runelite.client.util.ImageUtil;
 import net.runelite.http.api.RuneLiteAPI;
@@ -67,25 +69,32 @@ public class CombatSessionTrackerTest
 		tracker.onIncomingHitsplat(HitCategory.HEAL, 20, 103);
 		tracker.onGameTick(103);
 
-		// Swap to Osmumten's fang and land a max hit splat
+		// Swap to Osmumten's fang, fire a special attack, and land a max hit splat
 		tracker.updateEquippedWeapon(ItemID.OSMUMTENS_FANG, "Osmumten's fang");
+		tracker.recordSpecialAttackUsed(104);
 		tracker.onOutgoingHitsplat(42, "Vorkath", 732, HitCategory.DIRECT_MAX_HIT, 48, 104);
+		tracker.recordSkillXp(Skill.STRENGTH, 288);
+		tracker.recordSkillXp(Skill.HITPOINTS, 96);
 		tracker.onGameTick(104);
 		tracker.addSupplyCostGp(12_500L);
 
 		FightRecord kill1 = tracker.onNpcDeath(42, 104, 1_700_000_000_000L);
+		tracker.recordNpcLootValue("Vorkath", 140_000L);
 		assertNotNull(kill1);
 		assertEquals("Vorkath", kill1.getNpcName());
 		assertEquals(5, kill1.getDurationTicks());
 		assertEquals(72L, kill1.getDirectDamage());
 		assertEquals(10L, kill1.getStatusDamage());
 		assertEquals(48, kill1.getMaxHit());
+		assertEquals(48, kill1.getKillingHitDamage());
 		assertEquals(16L, kill1.getDamageTaken());
 		assertEquals(20L, kill1.getHealingReceived());
 		assertEquals(12_500L, kill1.getSupplyCostGp());
+		assertEquals(140_000L, kill1.getLootValueGp());
+		assertEquals(127_500L, kill1.getNetProfitGp());
 		assertEquals("Osmumten's fang", kill1.getPrimaryWeaponName());
 
-		// Advance 20 idle ticks: active timer should pause after idleTimeoutTicks (5), session timer keeps running
+		// Advance 20 idle ticks after kill: Active ticks must NOT bleed any idle-tail ticks!
 		for (int t = 105; t <= 124; t++)
 		{
 			tracker.onGameTick(t);
@@ -93,7 +102,8 @@ public class CombatSessionTrackerTest
 
 		SessionSnapshot snap = tracker.snapshot();
 		assertTrue(snap.isSessionStarted());
-		assertFalse("Should be out of active combat after idle gap", snap.isInActiveCombat());
+		assertFalse("Should be out of active combat immediately after all engaged NPCs die", snap.isInActiveCombat());
+		assertEquals("Active ticks must stay exact (5 ticks = 3.0s) with zero post-kill idle tail", 5, snap.getActiveTicks());
 		assertTrue("Active DPS must exceed continuous Session DPS after idle gap",
 			snap.getActiveDps() > snap.getSessionDps());
 		assertEquals(82L, snap.getTotalDamage());
@@ -102,6 +112,14 @@ public class CombatSessionTrackerTest
 		assertEquals(48, snap.getMaxHit());
 		assertEquals(1, snap.getNativeMaxSplats());
 		assertEquals(1, snap.getSessionKills());
+		assertEquals(1, snap.getBestHitStreak());
+		assertEquals(1, snap.getWorstMissStreak());
+		assertEquals(48.0, snap.getAverageKillingHit(), 0.01);
+		assertEquals(384L, snap.getTotalCombatXpGained());
+		assertEquals(2, snap.getSkillXp().size());
+		assertEquals(1, snap.getSpec().getUses());
+		assertEquals(1, snap.getSpec().getHits());
+		assertEquals(48, snap.getSpec().getMaxHit());
 		assertEquals(10L, snap.getStatusAndDefense().getVenomDealt());
 		assertEquals(50.0, snap.getStatusAndDefense().getEvadePercent(), 0.01);
 
@@ -124,11 +142,13 @@ public class CombatSessionTrackerTest
 		assertEquals(100.0, pctSum, 0.1);
 
 		// Verify CSV and summary exports
-		String summaryText = tracker.formatSummaryText(12_500L, true);
+		String summaryText = tracker.formatSummaryText(12_500L, 140_000L, true);
 		assertTrue(summaryText.contains("Vorkath"));
 		assertTrue(summaryText.contains("Osmumten's fang"));
+		assertTrue(summaryText.contains("Specs: 1 uses"));
 		String csv = tracker.formatHistoryCsv();
 		assertTrue(csv.contains("Vorkath,732,1,"));
+		assertTrue(csv.contains(",140000,12500,127500"));
 
 		// Verify HistorySerializer round-trip and malformed input resilience
 		HistorySerializer serializer = new HistorySerializer(RuneLiteAPI.GSON);
@@ -138,8 +158,38 @@ public class CombatSessionTrackerTest
 		assertEquals("Vorkath", restored.get(0).getNpcName());
 		assertEquals(1, restored.get(0).getKills());
 		assertEquals(12_500L, restored.get(0).getSupplyCostPerKillGp());
+		assertEquals(140_000L, restored.get(0).getLootPerKillGp());
+		assertEquals(127_500L, restored.get(0).getNetProfitPerKillGp());
 		assertTrue(serializer.deserialize("bad json").isEmpty());
 		assertTrue(serializer.deserialize("").isEmpty());
+
+		// Verify Pin A/B preserves baseline across resetSessionOnly
+		tracker.pinCurrentComparison(50_000L, 450_000L);
+		tracker.resetSessionOnly();
+		PinnedComparison pin = tracker.snapshot().getPinnedComparison();
+		assertNotNull("Pinned Setup A must survive resetSessionOnly for Setup B testing", pin);
+		assertTrue(pin.getLabel().contains("Vorkath"));
+		assertEquals(450_000L, pin.getNetProfitPerHour());
+		tracker.clearPinnedComparison();
+		assertEquals(null, tracker.snapshot().getPinnedComparison());
+	}
+
+	@Test
+	public void discardsIdleTailWhenDisengagingWithoutKill()
+	{
+		CombatSessionTracker tracker = new CombatSessionTracker();
+		tracker.setIdleTimeoutTicks(5);
+		tracker.updateEquippedWeapon(ItemID.ABYSSAL_WHIP, "Abyssal whip");
+
+		tracker.onOutgoingHitsplat(7, "Bandos", 624, HitCategory.DIRECT_HIT, 30, 10);
+		for (int t = 11; t <= 25; t++)
+		{
+			tracker.onGameTick(t);
+		}
+		SessionSnapshot snap = tracker.snapshot();
+		assertFalse(snap.isInActiveCombat());
+		assertEquals("Idle ticks after disengaging without a kill must not inflate activeTicks", 1, snap.getActiveTicks());
+		assertTrue("Session ticks must continue counting continuously", snap.getSessionTicks() >= 15);
 	}
 
 	@Test

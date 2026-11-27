@@ -71,14 +71,26 @@ public interface CombatBreakdownConfig extends Config
 
 	@ConfigItem(
 		keyName = "hudShowSupplyBurn",
-		name = "Show supply burn in HUD",
-		description = "Include supply cost/hr (or consumed counts on Ironman) in the HUD",
+		name = "Show profit / supply burn in HUD",
+		description = "Include net profit/hr or supply burn/hr (or item counts on Ironman) in the HUD",
 		section = hudSection,
 		position = 2
 	)
 	default boolean hudShowSupplyBurn()
 	{
 		return true;
+	}
+
+	@ConfigItem(
+		keyName = "hudShowCombatXp",
+		name = "Show combat XP/hr in HUD",
+		description = "Include total combat XP/hr in the compact on-screen HUD",
+		section = hudSection,
+		position = 3
+	)
+	default boolean hudShowCombatXp()
+	{
+		return false;
 	}
 
 	@Range(min = 3, max = 30)

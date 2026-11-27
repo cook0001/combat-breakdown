@@ -4,14 +4,19 @@ import com.combatbreakdown.CombatBreakdownConfig;
 import com.combatbreakdown.CombatBreakdownPlugin;
 import com.combatbreakdown.logic.CombatSessionTracker;
 import com.combatbreakdown.logic.CombatSessionTracker.SessionSnapshot;
+import com.combatbreakdown.logic.CombatSessionTracker.SkillXpEntry;
+import com.combatbreakdown.logic.CombatSessionTracker.SpecSnapshot;
 import com.combatbreakdown.logic.SupplyBurnTracker.BurnSnapshot;
+import com.combatbreakdown.logic.SupplyBurnTracker.LootSnapshot;
 import com.combatbreakdown.model.FightRecord;
 import com.combatbreakdown.model.HitDistribution;
+import com.combatbreakdown.model.PinnedComparison;
 import com.combatbreakdown.model.StatusDamageBreakdown;
 import com.combatbreakdown.model.SupplyUsage;
 import com.combatbreakdown.model.TargetSummary;
 import com.combatbreakdown.model.WeaponStats;
 import com.combatbreakdown.overlay.CombatHudOverlay;
+import java.awt.BasicStroke;
 import java.awt.BorderLayout;
 import java.awt.Color;
 import java.awt.Component;
@@ -24,9 +29,13 @@ import java.awt.GridBagConstraints;
 import java.awt.GridBagLayout;
 import java.awt.GridLayout;
 import java.awt.Insets;
+import java.awt.Polygon;
 import java.awt.Rectangle;
+import java.awt.RenderingHints;
+import java.awt.Stroke;
 import java.awt.Toolkit;
 import java.awt.datatransfer.StringSelection;
+import java.util.Collections;
 import java.util.LinkedHashMap;
 import java.util.List;
 import java.util.Locale;
@@ -57,7 +66,7 @@ public class CombatBreakdownPanel extends PluginPanel
 	private enum Tab
 	{
 		LIVE("Live"),
-		SUPPLIES("Supplies"),
+		SUPPLIES("Economy"),
 		HISTORY("History");
 
 		final String label;
@@ -69,6 +78,7 @@ public class CombatBreakdownPanel extends PluginPanel
 	}
 
 	private static final Color GREEN = new Color(46, 196, 118);
+	private static final Color GREEN_FILL = new Color(46, 196, 118, 45);
 	private static final Color GOLD = new Color(235, 180, 48);
 	private static final Color RED = new Color(232, 92, 92);
 	private static final Color BLUE = new Color(110, 186, 255);
@@ -78,6 +88,7 @@ public class CombatBreakdownPanel extends PluginPanel
 	private static final Color BORDER_SUBTLE = new Color(58, 63, 71);
 	private static final Color PILL_ACTIVE = new Color(42, 138, 96);
 	private static final Color BAR_TRACK = new Color(22, 25, 29);
+	private static final Stroke SPARK_STROKE = new BasicStroke(1.8f, BasicStroke.CAP_ROUND, BasicStroke.JOIN_ROUND);
 
 	private final CombatBreakdownPlugin plugin;
 	private final ConfigManager configManager;
@@ -89,6 +100,7 @@ public class CombatBreakdownPanel extends PluginPanel
 	private final JLabel toastLabel = new JLabel("");
 	private final Timer toastClearTimer;
 	private JButton pauseBtn;
+	private JButton pinBtn;
 	private final ViewportWidthPanel bodyPanel = new ViewportWidthPanel();
 
 	public CombatBreakdownPanel(
@@ -159,13 +171,27 @@ public class CombatBreakdownPanel extends PluginPanel
 		top.add(titleRow);
 		top.add(Box.createVerticalStrut(7));
 
-		JPanel actions = new JPanel(new GridLayout(1, 3, 4, 0));
+		JPanel actions = new JPanel(new GridLayout(1, 4, 3, 0));
 		actions.setOpaque(false);
 		actions.setAlignmentX(Component.LEFT_ALIGNMENT);
 		actions.setMaximumSize(new Dimension(Integer.MAX_VALUE, 25));
 
 		pauseBtn = flatButton("Pause", SURFACE_ELEVATED);
 		pauseBtn.addActionListener(e -> plugin.togglePaused());
+
+		pinBtn = flatButton("Pin A/B", SURFACE_ELEVATED);
+		pinBtn.setToolTipText("Pin current run as Setup A and reset counters so your next hit starts Setup B");
+		pinBtn.addActionListener(e ->
+		{
+			SessionSnapshot snap = plugin.getLatestSession();
+			if (snap == null || !snap.isSessionStarted())
+			{
+				showToast("Start combat first to pin Setup A");
+				return;
+			}
+			plugin.pinCurrentRunAndReset();
+			showToast("Pinned Setup A - ready for Setup B");
+		});
 
 		JButton resetBtn = flatButton("Reset", new Color(138, 52, 56));
 		resetBtn.setToolTipText("Reset live session metrics and supply counters (keeps saved target history)");
@@ -180,6 +206,7 @@ public class CombatBreakdownPanel extends PluginPanel
 		copyBtn.addActionListener(e -> copyToClipboard(plugin.buildSummaryText(), "Copied combat summary"));
 
 		actions.add(pauseBtn);
+		actions.add(pinBtn);
 		actions.add(resetBtn);
 		actions.add(copyBtn);
 		top.add(actions);
@@ -247,6 +274,9 @@ public class CombatBreakdownPanel extends PluginPanel
 			pauseBtn.setBackground(SURFACE_ELEVATED);
 		}
 
+		boolean hasPin = session != null && session.getPinnedComparison() != null;
+		pinBtn.setBackground(hasPin ? new Color(62, 104, 160) : SURFACE_ELEVATED);
+
 		for (Map.Entry<Tab, JButton> entry : tabButtons.entrySet())
 		{
 			boolean selected = entry.getKey() == activeTab;
@@ -258,10 +288,10 @@ public class CombatBreakdownPanel extends PluginPanel
 		switch (activeTab)
 		{
 			case LIVE:
-				buildLiveTab(session);
+				buildLiveTab(session, burn);
 				break;
 			case SUPPLIES:
-				buildSuppliesTab(session, burn);
+				buildEconomyTab(session, burn);
 				break;
 			case HISTORY:
 				buildHistoryTab(session);
@@ -273,15 +303,21 @@ public class CombatBreakdownPanel extends PluginPanel
 		bodyPanel.repaint();
 	}
 
-	private void buildLiveTab(SessionSnapshot session)
+	private void buildLiveTab(SessionSnapshot session, BurnSnapshot burn)
 	{
+		if (session != null && session.getPinnedComparison() != null)
+		{
+			bodyPanel.add(buildCompareCard(session, burn, session.getPinnedComparison()));
+			bodyPanel.add(Box.createVerticalStrut(6));
+		}
+
 		if (session == null || !session.isSessionStarted())
 		{
 			JPanel empty = cardPanel(BORDER_SUBTLE);
 			empty.add(sectionTitle("Ready to Track Combat", Color.WHITE));
 			empty.add(Box.createVerticalStrut(4));
 			empty.add(wrappingText(
-				"Attack any NPC to start tracking live Active DPS, continuous Session DPS, hit distribution, per-weapon comparisons, damage taken, and combat supply burn.",
+				"Attack any NPC to start tracking live Active DPS, continuous Session DPS, rolling 30s DPS sparkline, hit distribution, specs, combat XP/hr, weapon breakdown, and loot vs. supply burn.",
 				ColorScheme.LIGHT_GRAY_COLOR,
 				11f
 			));
@@ -320,6 +356,7 @@ public class CombatBreakdownPanel extends PluginPanel
 		dpsCard.add(dpsGrid);
 		dpsCard.add(Box.createVerticalStrut(6));
 
+		addKeyValueRow(dpsCard, "Rolling 30s DPS", String.format(Locale.US, "%.2f", session.getRolling30sDps()), GREEN);
 		addKeyValueRow(dpsCard, "Total Damage", String.format(Locale.US, "%,d", session.getTotalDamage()), Color.WHITE);
 		addKeyValueRow(dpsCard, "Accuracy",
 			String.format(Locale.US, "%.1f%% (%d/%d)", session.getAccuracyPercent(), session.getTotalHitsLanded(), session.getTotalSwings()),
@@ -333,11 +370,45 @@ public class CombatBreakdownPanel extends PluginPanel
 			? String.format(Locale.US, "%d (%.1f/hr)", session.getSessionKills(), session.getKillsPerHour())
 			: "0";
 		addKeyValueRow(dpsCard, "Kills", killText, GREEN);
+		addKeyValueRow(dpsCard, "Hit / Miss Streak",
+			session.getBestHitStreak() + " hit / " + session.getWorstMissStreak() + " miss",
+			ColorScheme.LIGHT_GRAY_COLOR);
+		if (session.getSessionKills() > 0 && session.getAverageKillingHit() > 0)
+		{
+			addKeyValueRow(dpsCard, "Avg Killing Blow", String.format(Locale.US, "%.1f", session.getAverageKillingHit()), GOLD);
+		}
 
 		bodyPanel.add(dpsCard);
 		bodyPanel.add(Box.createVerticalStrut(6));
 
-		// 2. Hit Distribution Card
+		// 2. Rolling DPS Sparkline Chart
+		if (session.getDpsSparkline().size() >= 2)
+		{
+			JPanel sparkCard = cardPanel(BORDER_SUBTLE);
+			double peak = 0.0;
+			for (double d : session.getDpsSparkline())
+			{
+				if (d > peak)
+				{
+					peak = d;
+				}
+			}
+			JPanel sparkHead = new JPanel(new BorderLayout(4, 0));
+			sparkHead.setOpaque(false);
+			sparkHead.setAlignmentX(Component.LEFT_ALIGNMENT);
+			sparkHead.add(sectionTitle("DPS Curve", ColorScheme.LIGHT_GRAY_COLOR), BorderLayout.WEST);
+			JLabel peakLbl = new JLabel(String.format(Locale.US, "Peak %.2f", peak));
+			peakLbl.setForeground(GREEN);
+			peakLbl.setFont(peakLbl.getFont().deriveFont(Font.BOLD, 10f));
+			sparkHead.add(peakLbl, BorderLayout.EAST);
+			sparkCard.add(sparkHead);
+			sparkCard.add(Box.createVerticalStrut(5));
+			sparkCard.add(new SparklinePanel(session.getDpsSparkline(), peak));
+			bodyPanel.add(sparkCard);
+			bodyPanel.add(Box.createVerticalStrut(6));
+		}
+
+		// 3. Hit Distribution Card
 		List<HitDistribution.Bucket> buckets = session.getHitBuckets();
 		if (!buckets.isEmpty())
 		{
@@ -371,7 +442,49 @@ public class CombatBreakdownPanel extends PluginPanel
 			bodyPanel.add(Box.createVerticalStrut(6));
 		}
 
-		// 3. Defense, Healing & Status Damage Card
+		// 4. Special Attack Breakdown (only when specs have been used)
+		SpecSnapshot spec = session.getSpec();
+		if (spec.getUses() > 0)
+		{
+			JPanel specCard = cardPanel(BORDER_SUBTLE);
+			specCard.add(sectionTitle("Special Attacks", GOLD));
+			specCard.add(Box.createVerticalStrut(4));
+			addKeyValueRow(specCard, "Specs Used", Integer.toString(spec.getUses()), Color.WHITE);
+			addKeyValueRow(specCard, "Spec Accuracy",
+				String.format(Locale.US, "%.1f%% (%d/%d)", spec.getAccuracyPercent(), spec.getHits(), spec.getTotalSplats()),
+				GREEN);
+			addKeyValueRow(specCard, "Avg / Spec", String.format(Locale.US, "%.1f", spec.getAveragePerUse()), Color.WHITE);
+			addKeyValueRow(specCard, "Max Spec Hit", Integer.toString(spec.getMaxHit()), GOLD);
+			bodyPanel.add(specCard);
+			bodyPanel.add(Box.createVerticalStrut(6));
+		}
+
+		// 5. Combat XP / hr Card
+		if (session.getTotalCombatXpGained() > 0)
+		{
+			JPanel xpCard = cardPanel(BORDER_SUBTLE);
+			JPanel xpHead = new JPanel(new BorderLayout(4, 0));
+			xpHead.setOpaque(false);
+			xpHead.setAlignmentX(Component.LEFT_ALIGNMENT);
+			xpHead.add(sectionTitle("Combat XP", ColorScheme.LIGHT_GRAY_COLOR), BorderLayout.WEST);
+			JLabel totalXpLbl = new JLabel(CombatHudOverlay.formatCompactNumber(Math.round(session.getCombatXpPerHour())) + "/hr");
+			totalXpLbl.setForeground(BLUE);
+			totalXpLbl.setFont(totalXpLbl.getFont().deriveFont(Font.BOLD, 10.5f));
+			xpHead.add(totalXpLbl, BorderLayout.EAST);
+			xpCard.add(xpHead);
+			xpCard.add(Box.createVerticalStrut(4));
+
+			for (SkillXpEntry entry : session.getSkillXp())
+			{
+				String val = CombatHudOverlay.formatCompactNumber(entry.getXpGained())
+					+ " (" + CombatHudOverlay.formatCompactNumber(Math.round(entry.getXpPerHour())) + "/hr)";
+				addKeyValueRow(xpCard, entry.getSkill().getName(), val, Color.WHITE);
+			}
+			bodyPanel.add(xpCard);
+			bodyPanel.add(Box.createVerticalStrut(6));
+		}
+
+		// 6. Defense, Healing & Status Damage Card
 		StatusDamageBreakdown.Snapshot st = session.getStatusAndDefense();
 		JPanel defCard = cardPanel(BORDER_SUBTLE);
 		defCard.add(sectionTitle("Defense, Healing & Status", ColorScheme.LIGHT_GRAY_COLOR));
@@ -421,7 +534,7 @@ public class CombatBreakdownPanel extends PluginPanel
 		}
 		bodyPanel.add(defCard);
 
-		// 4. Per-Weapon Comparison Cards
+		// 7. Per-Weapon Comparison Cards
 		if (!session.getWeapons().isEmpty())
 		{
 			bodyPanel.add(Box.createVerticalStrut(6));
@@ -436,6 +549,60 @@ public class CombatBreakdownPanel extends PluginPanel
 			}
 			bodyPanel.add(wepCard);
 		}
+	}
+
+	private JPanel buildCompareCard(SessionSnapshot session, BurnSnapshot burn, PinnedComparison pin)
+	{
+		JPanel card = cardPanel(BLUE);
+		JPanel head = new JPanel(new BorderLayout(4, 0));
+		head.setOpaque(false);
+		head.setAlignmentX(Component.LEFT_ALIGNMENT);
+		head.add(sectionTitle("Compare vs. Setup A", BLUE), BorderLayout.WEST);
+
+		JButton unpinBtn = flatButton("Unpin", SURFACE_ELEVATED);
+		unpinBtn.setFont(unpinBtn.getFont().deriveFont(Font.BOLD, 9.5f));
+		unpinBtn.setBorder(new EmptyBorder(2, 6, 2, 6));
+		unpinBtn.addActionListener(e -> plugin.unpinComparison());
+		head.add(unpinBtn, BorderLayout.EAST);
+		card.add(head);
+		card.add(Box.createVerticalStrut(3));
+		card.add(wrappingText("Baseline: " + pin.getLabel(), ColorScheme.LIGHT_GRAY_COLOR, 10f));
+		card.add(Box.createVerticalStrut(4));
+
+		if (!session.isSessionStarted())
+		{
+			card.add(wrappingText("Attack a target to compare Setup B against Setup A (" + String.format(Locale.US, "%.2f DPS", pin.getActiveDps()) + ").", GOLD, 10f));
+			return card;
+		}
+
+		double dpsDiff = session.getActiveDps() - pin.getActiveDps();
+		addKeyValueRow(card, "Active DPS",
+			String.format(Locale.US, "%.2f (%+.2f)", session.getActiveDps(), dpsDiff),
+			dpsDiff >= 0 ? GREEN : RED);
+
+		double accDiff = session.getAccuracyPercent() - pin.getAccuracyPercent();
+		addKeyValueRow(card, "Accuracy",
+			String.format(Locale.US, "%.1f%% (%+.1f%%)", session.getAccuracyPercent(), accDiff),
+			accDiff >= 0 ? GREEN : RED);
+
+		if (session.getTotalCombatXpGained() > 0 || pin.getCombatXpPerHour() > 0)
+		{
+			double xpDiff = session.getCombatXpPerHour() - pin.getCombatXpPerHour();
+			addKeyValueRow(card, "Combat XP/hr",
+				CombatHudOverlay.formatCompactNumber(Math.round(session.getCombatXpPerHour()))
+					+ " (" + (xpDiff >= 0 ? "+" : "") + CombatHudOverlay.formatCompactNumber(Math.round(xpDiff)) + ")",
+				xpDiff >= 0 ? GREEN : RED);
+		}
+
+		if (plugin.shouldDisplayGpValues() && burn != null)
+		{
+			long netDiff = burn.getNetProfitPerHour() - pin.getNetProfitPerHour();
+			addKeyValueRow(card, "Net GP/hr",
+				CombatHudOverlay.formatCompactGp(burn.getNetProfitPerHour())
+					+ " (" + (netDiff >= 0 ? "+" : "") + CombatHudOverlay.formatCompactGp(netDiff) + ")",
+				netDiff >= 0 ? GREEN : RED);
+		}
+		return card;
 	}
 
 	private JPanel buildWeaponRow(WeaponStats.Snapshot wep)
@@ -495,20 +662,20 @@ public class CombatBreakdownPanel extends PluginPanel
 		return row;
 	}
 
-	private void buildSuppliesTab(SessionSnapshot session, BurnSnapshot burn)
+	private void buildEconomyTab(SessionSnapshot session, BurnSnapshot burn)
 	{
 		boolean showGp = plugin.shouldDisplayGpValues();
 		double sessionSec = session != null ? session.getSessionSeconds() : 0.0;
 		int kills = session != null ? session.getSessionKills() : 0;
 
 		JPanel summary = cardPanel(BORDER_SUBTLE);
-		summary.add(sectionTitle("Supply Burn Summary", Color.WHITE));
+		summary.add(sectionTitle("Loot & Supply Burn", Color.WHITE));
 		summary.add(Box.createVerticalStrut(5));
 
 		if (burn == null || burn.isEmpty())
 		{
 			summary.add(wrappingText(
-				"No combat supplies consumed yet. Food, potion doses, ammo, cannonballs, and runes used during combat will appear here. Banking, GE, trades, and dropped items are automatically ignored.",
+				"No combat loot or supplies recorded yet. Loot drops plus food, potion doses, ammo, cannonballs, and runes used during combat will appear here. Banking, GE, trades, and dropped items are automatically ignored.",
 				ColorScheme.LIGHT_GRAY_COLOR,
 				10.8f
 			));
@@ -518,18 +685,30 @@ public class CombatBreakdownPanel extends PluginPanel
 
 		if (showGp)
 		{
+			long net = burn.getNetProfitGp();
 			JPanel gpGrid = new JPanel(new GridLayout(1, 2, 6, 0));
 			gpGrid.setOpaque(false);
 			gpGrid.setAlignmentX(Component.LEFT_ALIGNMENT);
-			gpGrid.add(metricTile("Total Burn", CombatHudOverlay.formatCompactGp(burn.getTotalCostGp()),
-				kills > 0 ? (CombatHudOverlay.formatCompactGp(burn.getGpPerKill()) + "/kill") : "Session", GOLD));
-			gpGrid.add(metricTile("Burn Rate", CombatHudOverlay.formatCompactGp(burn.getGpPerHour()), "per hour", RED));
+			gpGrid.add(metricTile(
+				"Net Profit",
+				(net >= 0 ? "+" : "") + CombatHudOverlay.formatCompactGp(net),
+				kills > 0 ? (CombatHudOverlay.formatCompactGp(burn.getNetProfitPerKillGp()) + "/kc") : "Session",
+				net >= 0 ? GREEN : RED
+			));
+			gpGrid.add(metricTile(
+				"Net / Hour",
+				(burn.getNetProfitPerHour() >= 0 ? "+" : "") + CombatHudOverlay.formatCompactGp(burn.getNetProfitPerHour()),
+				"Burn " + CombatHudOverlay.formatCompactGp(burn.getGpPerHour()) + "/hr",
+				burn.getNetProfitPerHour() >= 0 ? GREEN : RED
+			));
 			summary.add(gpGrid);
 			summary.add(Box.createVerticalStrut(6));
+			addKeyValueRow(summary, "Loot Received", CombatHudOverlay.formatCompactGp(burn.getTotalLootGp()), GREEN);
+			addKeyValueRow(summary, "Supply Burn", CombatHudOverlay.formatCompactGp(burn.getTotalCostGp()), GOLD);
 		}
 		else if (plugin.isIronmanAccount())
 		{
-			summary.add(wrappingText("Ironman mode: showing exact supply counts (GE GP hidden in config).", BLUE, 10f));
+			summary.add(wrappingText("Ironman mode: showing exact item counts (GE GP hidden in config).", BLUE, 10f));
 			summary.add(Box.createVerticalStrut(4));
 		}
 
@@ -538,18 +717,35 @@ public class CombatBreakdownPanel extends PluginPanel
 		addKeyValueRow(summary, "Ammo / Cannonballs", Long.toString(burn.getAmmoUsed()), GOLD);
 		addKeyValueRow(summary, "Runes Cast", Long.toString(burn.getRunesUsed()), PURPLE);
 		bodyPanel.add(summary);
-		bodyPanel.add(Box.createVerticalStrut(6));
 
-		JPanel listCard = cardPanel(BORDER_SUBTLE);
-		listCard.add(sectionTitle("Consumed Supplies", ColorScheme.LIGHT_GRAY_COLOR));
-		listCard.add(Box.createVerticalStrut(5));
-
-		for (SupplyUsage.Snapshot item : burn.getItems())
+		if (!burn.getItems().isEmpty())
 		{
-			listCard.add(buildSupplyRow(item, sessionSec, kills, showGp));
-			listCard.add(Box.createVerticalStrut(4));
+			bodyPanel.add(Box.createVerticalStrut(6));
+			JPanel listCard = cardPanel(BORDER_SUBTLE);
+			listCard.add(sectionTitle("Consumed Supplies", ColorScheme.LIGHT_GRAY_COLOR));
+			listCard.add(Box.createVerticalStrut(5));
+			for (SupplyUsage.Snapshot item : burn.getItems())
+			{
+				listCard.add(buildSupplyRow(item, sessionSec, kills, showGp));
+				listCard.add(Box.createVerticalStrut(4));
+			}
+			bodyPanel.add(listCard);
 		}
-		bodyPanel.add(listCard);
+
+		if (!burn.getLootItems().isEmpty())
+		{
+			bodyPanel.add(Box.createVerticalStrut(6));
+			JPanel lootCard = cardPanel(BORDER_SUBTLE);
+			lootCard.add(sectionTitle("Session Loot Drops", ColorScheme.LIGHT_GRAY_COLOR));
+			lootCard.add(Box.createVerticalStrut(5));
+			int limit = Math.min(20, burn.getLootItems().size());
+			for (int i = 0; i < limit; i++)
+			{
+				lootCard.add(buildLootRow(burn.getLootItems().get(i), showGp));
+				lootCard.add(Box.createVerticalStrut(4));
+			}
+			bodyPanel.add(lootCard);
+		}
 	}
 
 	private JPanel buildSupplyRow(SupplyUsage.Snapshot item, double sessionSec, int kills, boolean showGp)
@@ -620,11 +816,59 @@ public class CombatBreakdownPanel extends PluginPanel
 		return row;
 	}
 
+	private JPanel buildLootRow(LootSnapshot loot, boolean showGp)
+	{
+		JPanel row = new JPanel(new GridBagLayout());
+		row.setBackground(SURFACE_ELEVATED);
+		row.setBorder(BorderFactory.createCompoundBorder(
+			BorderFactory.createLineBorder(BORDER_SUBTLE),
+			new EmptyBorder(4, 6, 4, 6)
+		));
+		row.setAlignmentX(Component.LEFT_ALIGNMENT);
+
+		GridBagConstraints gbc = new GridBagConstraints();
+		gbc.gridy = 0;
+		gbc.insets = new Insets(0, 0, 0, 6);
+		gbc.anchor = GridBagConstraints.WEST;
+
+		JLabel iconLbl = new JLabel();
+		iconLbl.setPreferredSize(new Dimension(26, 22));
+		iconLbl.setHorizontalAlignment(SwingConstants.CENTER);
+		if (loot.getItemId() > 0)
+		{
+			AsyncBufferedImage img = itemManager.getImage(loot.getItemId());
+			img.addTo(iconLbl);
+		}
+		gbc.gridx = 0;
+		gbc.weightx = 0;
+		row.add(iconLbl, gbc);
+
+		JTextArea nameArea = wrappingText(loot.getDisplayName() + " x" + CombatHudOverlay.formatCompactNumber(loot.getQuantity()), Color.WHITE, 10.5f);
+		gbc.gridx = 1;
+		gbc.weightx = 1.0;
+		gbc.fill = GridBagConstraints.HORIZONTAL;
+		row.add(nameArea, gbc);
+
+		if (showGp && loot.getTotalValueGp() > 0)
+		{
+			JLabel valLbl = new JLabel(CombatHudOverlay.formatCompactGp(loot.getTotalValueGp()));
+			valLbl.setForeground(GREEN);
+			valLbl.setFont(valLbl.getFont().deriveFont(Font.BOLD, 10.5f));
+			gbc.gridx = 2;
+			gbc.weightx = 0;
+			gbc.fill = GridBagConstraints.NONE;
+			gbc.insets = new Insets(0, 4, 0, 0);
+			gbc.anchor = GridBagConstraints.EAST;
+			row.add(valLbl, gbc);
+		}
+		return row;
+	}
+
 	private void buildHistoryTab(SessionSnapshot session)
 	{
 		boolean showGp = plugin.shouldDisplayGpValues();
-		List<TargetSummary> targets = session != null ? session.getTargetSummaries() : java.util.Collections.emptyList();
-		List<FightRecord> recent = session != null ? session.getRecentFights() : java.util.Collections.emptyList();
+		List<TargetSummary> targets = session != null ? session.getTargetSummaries() : Collections.emptyList();
+		List<FightRecord> recent = session != null ? session.getRecentFights() : Collections.emptyList();
 
 		JPanel tools = new JPanel(new GridLayout(1, 2, 4, 0));
 		tools.setOpaque(false);
@@ -660,7 +904,7 @@ public class CombatBreakdownPanel extends PluginPanel
 			empty.add(sectionTitle("No Completed Kills Yet", Color.WHITE));
 			empty.add(Box.createVerticalStrut(4));
 			empty.add(wrappingText(
-				"Finish a kill to record per-NPC kill count, average and fastest kill time, DPS, accuracy, damage taken, and supply cost per kill.",
+				"Finish a kill to record per-NPC kill count, average and fastest kill time, DPS, accuracy, damage taken, loot value, and net profit per kill.",
 				ColorScheme.LIGHT_GRAY_COLOR,
 				10.8f
 			));
@@ -695,9 +939,16 @@ public class CombatBreakdownPanel extends PluginPanel
 			addKeyValueRow(card, "Max Hit | Taken",
 				String.format(Locale.US, "%d | %,d", target.getMaxHit(), target.getTotalDamageTaken()),
 				GOLD);
-			if (showGp && target.getTotalSupplyCostGp() > 0)
+			if (showGp && (target.getTotalLootValueGp() > 0 || target.getTotalSupplyCostGp() > 0))
 			{
-				addKeyValueRow(card, "Cost / Kill", CombatHudOverlay.formatCompactGp(target.getSupplyCostPerKillGp()), RED);
+				long netKc = target.getNetProfitPerKillGp();
+				addKeyValueRow(card, "Loot / Burn /kc",
+					CombatHudOverlay.formatCompactGp(target.getLootPerKillGp())
+						+ " / " + CombatHudOverlay.formatCompactGp(target.getSupplyCostPerKillGp()),
+					ColorScheme.LIGHT_GRAY_COLOR);
+				addKeyValueRow(card, "Net / Kill",
+					(netKc >= 0 ? "+" : "") + CombatHudOverlay.formatCompactGp(netKc),
+					netKc >= 0 ? GREEN : RED);
 			}
 			bodyPanel.add(card);
 			bodyPanel.add(Box.createVerticalStrut(5));
@@ -800,12 +1051,12 @@ public class CombatBreakdownPanel extends PluginPanel
 
 		JLabel v = new JLabel(value);
 		v.setForeground(accent);
-		v.setFont(v.getFont().deriveFont(Font.BOLD, 15f));
+		v.setFont(v.getFont().deriveFont(Font.BOLD, 14f));
 		v.setAlignmentX(Component.LEFT_ALIGNMENT);
 
 		JLabel s = new JLabel(sub);
 		s.setForeground(ColorScheme.LIGHT_GRAY_COLOR);
-		s.setFont(s.getFont().deriveFont(9.8f));
+		s.setFont(s.getFont().deriveFont(9.5f));
 		s.setAlignmentX(Component.LEFT_ALIGNMENT);
 
 		tile.add(l);
@@ -831,12 +1082,12 @@ public class CombatBreakdownPanel extends PluginPanel
 
 		JLabel k = new JLabel(key);
 		k.setForeground(ColorScheme.LIGHT_GRAY_COLOR);
-		k.setFont(k.getFont().deriveFont(10.8f));
+		k.setFont(k.getFont().deriveFont(10.5f));
 		row.add(k, BorderLayout.WEST);
 
 		JLabel v = new JLabel(value);
 		v.setForeground(valueColor);
-		v.setFont(v.getFont().deriveFont(Font.BOLD, 10.8f));
+		v.setFont(v.getFont().deriveFont(Font.BOLD, 10.5f));
 		row.add(v, BorderLayout.EAST);
 
 		parent.add(row);
@@ -864,10 +1115,68 @@ public class CombatBreakdownPanel extends PluginPanel
 		btn.setFocusPainted(false);
 		btn.setBackground(bg);
 		btn.setForeground(Color.WHITE);
-		btn.setBorder(new EmptyBorder(4, 6, 4, 6));
-		btn.setFont(btn.getFont().deriveFont(Font.BOLD, 10.5f));
+		btn.setBorder(new EmptyBorder(4, 4, 4, 4));
+		btn.setFont(btn.getFont().deriveFont(Font.BOLD, 10.2f));
 		btn.setCursor(Cursor.getPredefinedCursor(Cursor.HAND_CURSOR));
 		return btn;
+	}
+
+	private static final class SparklinePanel extends JPanel
+	{
+		private final List<Double> samples;
+		private final double peak;
+
+		SparklinePanel(List<Double> samples, double peak)
+		{
+			this.samples = samples;
+			this.peak = Math.max(0.5, peak);
+			setOpaque(false);
+			setPreferredSize(new Dimension(100, 44));
+			setMaximumSize(new Dimension(Integer.MAX_VALUE, 44));
+			setAlignmentX(Component.LEFT_ALIGNMENT);
+		}
+
+		@Override
+		protected void paintComponent(Graphics g)
+		{
+			super.paintComponent(g);
+			int w = getWidth();
+			int h = getHeight();
+			if (w <= 6 || h <= 6 || samples.size() < 2)
+			{
+				return;
+			}
+			Graphics2D g2 = (Graphics2D) g.create();
+			g2.setRenderingHint(RenderingHints.KEY_ANTIALIASING, RenderingHints.VALUE_ANTIALIAS_ON);
+
+			g2.setColor(BAR_TRACK);
+			g2.fillRoundRect(0, 0, w, h, 4, 4);
+
+			int pad = 4;
+			int plotW = w - pad * 2;
+			int plotH = h - pad * 2;
+			int n = samples.size();
+			int[] xs = new int[n];
+			int[] ys = new int[n];
+			Polygon fill = new Polygon();
+			fill.addPoint(pad, h - pad);
+
+			for (int i = 0; i < n; i++)
+			{
+				double norm = Math.max(0.0, Math.min(1.0, samples.get(i) / peak));
+				xs[i] = pad + (int) Math.round((plotW * (double) i) / (n - 1));
+				ys[i] = (h - pad) - (int) Math.round(plotH * norm);
+				fill.addPoint(xs[i], ys[i]);
+			}
+			fill.addPoint(xs[n - 1], h - pad);
+
+			g2.setColor(GREEN_FILL);
+			g2.fillPolygon(fill);
+			g2.setColor(GREEN);
+			g2.setStroke(SPARK_STROKE);
+			g2.drawPolyline(xs, ys, n);
+			g2.dispose();
+		}
 	}
 
 	private static final class PercentBar extends JPanel

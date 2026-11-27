@@ -120,9 +120,17 @@ public class SupplyBurnTrackerTest
 		assertEquals("Depositing in bank must not count as consumed",
 			0L, tracker.onStateUpdate(Collections.emptyMap(), -1, 0, -1, 0, Collections.emptyMap(), true, false, false, 13, META));
 
+		// Record NPC loot drops (15,000 coins + 10 Sharks = 25,000 gp)
+		assertEquals(15_000L, tracker.recordLootDrop(ItemID.COINS, 15_000, META));
+		assertEquals(10_000L, tracker.recordLootDrop(ItemID.SHARK, 10, META));
+
 		BurnSnapshot snap = tracker.snapshot(60.0, 2);
 		assertEquals(9300L, snap.getTotalCostGp());
 		assertEquals(4650L, snap.getGpPerKill());
+		assertEquals(25_000L, snap.getTotalLootGp());
+		assertEquals(15_700L, snap.getNetProfitGp());
+		assertEquals(7850L, snap.getNetProfitPerKillGp());
+		assertEquals(2, snap.getLootItems().size());
 		assertEquals(2L, snap.getFoodEaten());
 		assertEquals(1L, snap.getPotionDoses());
 		assertEquals(16L, snap.getAmmoUsed());

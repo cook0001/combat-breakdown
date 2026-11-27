@@ -22,8 +22,15 @@ public class FightRecord
 	private long damageTaken;
 	private long healingReceived;
 	private long supplyCostGp;
+	private long lootValueGp;
+	private int killingHitDamage;
 	private String primaryWeaponName;
 	private long completedAtEpochMs;
+
+	public long getNetProfitGp()
+	{
+		return lootValueGp - supplyCostGp;
+	}
 
 	public long getTotalDamage()
 	{

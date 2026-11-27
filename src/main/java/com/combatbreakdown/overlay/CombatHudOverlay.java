@@ -98,6 +98,12 @@ public class CombatHudOverlay extends OverlayPanel
 			maxWidth = addRow(fm, maxWidth, "Taken / Heal", takenText, MUTED_TEXT, taken > 0 ? DAMAGE_RED : MUTED_TEXT);
 		}
 
+		if (config.hudShowCombatXp() && session.getTotalCombatXpGained() > 0)
+		{
+			maxWidth = addRow(fm, maxWidth, "Combat XP", formatCompactNumber(Math.round(session.getCombatXpPerHour())) + "/hr",
+				MUTED_TEXT, ACCENT_BLUE);
+		}
+
 		if (config.hudShowSupplyBurn() && config.trackSupplyBurn())
 		{
 			BurnSnapshot burn = plugin.getLatestBurn();
@@ -105,8 +111,17 @@ public class CombatHudOverlay extends OverlayPanel
 			{
 				if (plugin.shouldDisplayGpValues())
 				{
-					String gpText = formatCompactGp(burn.getGpPerHour()) + "/hr";
-					maxWidth = addRow(fm, maxWidth, "Supply Burn", gpText, MUTED_TEXT, WARN_GOLD);
+					if (burn.getTotalLootGp() > 0)
+					{
+						long netHr = burn.getNetProfitPerHour();
+						String netText = (netHr >= 0 ? "+" : "") + formatCompactGp(netHr) + "/hr";
+						maxWidth = addRow(fm, maxWidth, "Net Profit", netText, MUTED_TEXT, netHr >= 0 ? ACTIVE_GREEN : DAMAGE_RED);
+					}
+					else
+					{
+						String gpText = formatCompactGp(burn.getGpPerHour()) + "/hr";
+						maxWidth = addRow(fm, maxWidth, "Supply Burn", gpText, MUTED_TEXT, WARN_GOLD);
+					}
 				}
 				else
 				{
@@ -134,19 +149,36 @@ public class CombatHudOverlay extends OverlayPanel
 
 	public static String formatCompactGp(long gp)
 	{
-		if (gp >= 10_000_000L)
+		long abs = Math.abs(gp);
+		String sign = gp < 0 ? "-" : "";
+		if (abs >= 10_000_000L)
 		{
-			return String.format(Locale.US, "%.1fM gp", gp / 1_000_000.0);
+			return String.format(Locale.US, "%s%.1fM gp", sign, abs / 1_000_000.0);
 		}
-		if (gp >= 100_000L)
+		if (abs >= 100_000L)
 		{
-			return String.format(Locale.US, "%.0fK gp", gp / 1_000.0);
+			return String.format(Locale.US, "%s%.0fK gp", sign, abs / 1_000.0);
 		}
-		if (gp >= 10_000L)
+		if (abs >= 10_000L)
 		{
-			return String.format(Locale.US, "%.1fK gp", gp / 1_000.0);
+			return String.format(Locale.US, "%s%.1fK gp", sign, abs / 1_000.0);
 		}
-		return String.format(Locale.US, "%,d gp", gp);
+		return String.format(Locale.US, "%s%,d gp", sign, abs);
+	}
+
+	public static String formatCompactNumber(long value)
+	{
+		long abs = Math.abs(value);
+		String sign = value < 0 ? "-" : "";
+		if (abs >= 1_000_000L)
+		{
+			return String.format(Locale.US, "%s%.2fM", sign, abs / 1_000_000.0);
+		}
+		if (abs >= 10_000L)
+		{
+			return String.format(Locale.US, "%s%.1fK", sign, abs / 1_000.0);
+		}
+		return String.format(Locale.US, "%s%,d", sign, abs);
 	}
 
 	private static String truncate(String text, int maxLen)

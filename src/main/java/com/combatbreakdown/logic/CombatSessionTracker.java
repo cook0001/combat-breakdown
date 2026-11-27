@@ -3,6 +3,7 @@ package com.combatbreakdown.logic;
 import com.combatbreakdown.model.FightRecord;
 import com.combatbreakdown.model.HitCategory;
 import com.combatbreakdown.model.HitDistribution;
+import com.combatbreakdown.model.PinnedComparison;
 import com.combatbreakdown.model.StatusDamageBreakdown;
 import com.combatbreakdown.model.TargetSummary;
 import com.combatbreakdown.model.WeaponStats;
@@ -11,6 +12,7 @@ import java.util.ArrayList;
 import java.util.Collections;
 import java.util.Comparator;
 import java.util.Deque;
+import java.util.EnumMap;
 import java.util.HashMap;
 import java.util.Iterator;
 import java.util.LinkedHashMap;
@@ -19,10 +21,14 @@ import java.util.Locale;
 import java.util.Map;
 import javax.annotation.Nullable;
 import lombok.Value;
+import net.runelite.api.Skill;
 
 public final class CombatSessionTracker
 {
 	public static final int MAX_RECENT_FIGHTS = 40;
+	public static final int ROLLING_WINDOW_TICKS = 50; // 30 seconds
+	private static final int SPARKLINE_INTERVAL_TICKS = 5; // 3 seconds
+	private static final int MAX_SPARKLINE_POINTS = 40;
 	private static final int ABANDONED_NPC_TICKS = 100;
 
 	private static final class ActiveNpcFight
@@ -37,6 +43,7 @@ public final class CombatSessionTracker
 		int hitsLanded;
 		int misses;
 		int maxHit;
+		int lastDirectDamage;
 		long damageTaken;
 		long healingReceived;
 		final Map<String, Long> damageByWeapon = new HashMap<>();
@@ -66,10 +73,58 @@ public final class CombatSessionTracker
 		}
 	}
 
+	@Value
+	private static class TimedDamage
+	{
+		int tick;
+		int damage;
+	}
+
+	@Value
+	public static class SpecSnapshot
+	{
+		int uses;
+		int hits;
+		int misses;
+		long totalDamage;
+		int maxHit;
+
+		public int getTotalSplats()
+		{
+			return hits + misses;
+		}
+
+		public double getAccuracyPercent()
+		{
+			int total = getTotalSplats();
+			return total > 0 ? (hits * 100.0) / total : 0.0;
+		}
+
+		public double getAveragePerUse()
+		{
+			return uses > 0 ? ((double) totalDamage) / uses : 0.0;
+		}
+	}
+
+	@Value
+	public static class SkillXpEntry
+	{
+		Skill skill;
+		long xpGained;
+		double xpPerHour;
+	}
+
 	private int idleTimeoutTicks = 10;
 	private boolean paused;
 	private boolean sessionStarted;
+
+	// Confirmed active combat ticks (excludes trailing idle cooldowns after combat stops)
+	private boolean inActiveBout;
 	private int activeTicks;
+	private int pendingActiveTicks;
+	private final Map<Integer, Integer> pendingWeaponTicks = new HashMap<>();
+	private int lastActiveTickCounted = -10000;
+
 	private int sessionTicks;
 	private int lastCombatTick = -10000;
 	private int currentTick;
@@ -80,6 +135,32 @@ public final class CombatSessionTracker
 	private int totalHitsLanded;
 	private int totalMisses;
 	private int sessionKills;
+
+	// Streaks & finishing hits
+	private int currentHitStreak;
+	private int bestHitStreak;
+	private int currentMissStreak;
+	private int worstMissStreak;
+	private long totalKillingHitDamage;
+	private int killingHitCount;
+
+	// Rolling 30s DPS & sparkline history
+	private final Deque<TimedDamage> rollingWindow = new ArrayDeque<>();
+	private long rollingWindowDamage;
+	private final Deque<Double> dpsSparkline = new ArrayDeque<>();
+	private int lastSparklineTick = -10000;
+
+	// Special attack tracking
+	private int lastSpecUsedTick = -100;
+	private int specUses;
+	private int specHits;
+	private int specMisses;
+	private long specTotalDamage;
+	private int specMaxHit;
+
+	// Combat XP tracking
+	private final Map<Skill, Long> xpGainedBySkill = new EnumMap<>(Skill.class);
+	private long totalCombatXpGained;
 
 	private final HitDistribution hitDistribution = new HitDistribution();
 	private final StatusDamageBreakdown statusAndDefense = new StatusDamageBreakdown();
@@ -92,6 +173,9 @@ public final class CombatSessionTracker
 	private String lastTargetName = "";
 	private int lastTargetCombatLevel;
 	private long unattributedSupplyCostGp;
+
+	@Nullable
+	private PinnedComparison pinnedComparison;
 
 	public void setIdleTimeoutTicks(int idleTimeoutTicks)
 	{
@@ -110,13 +194,34 @@ public final class CombatSessionTracker
 
 	public boolean isInActiveCombat()
 	{
-		return sessionStarted && !paused && (currentTick - lastCombatTick) <= idleTimeoutTicks;
+		return sessionStarted && !paused && inActiveBout && (currentTick - lastCombatTick) <= idleTimeoutTicks;
 	}
 
 	public void updateEquippedWeapon(int weaponItemId, @Nullable String weaponName)
 	{
 		this.currentWeaponId = weaponItemId;
 		this.currentWeaponName = (weaponName != null && !weaponName.trim().isEmpty()) ? weaponName.trim() : "Unarmed";
+	}
+
+	public void recordSpecialAttackUsed(int tick)
+	{
+		if (paused)
+		{
+			return;
+		}
+		this.currentTick = tick;
+		this.lastSpecUsedTick = tick;
+		this.specUses++;
+	}
+
+	public void recordSkillXp(Skill skill, long deltaXp)
+	{
+		if (paused || skill == null || deltaXp <= 0 || !sessionStarted)
+		{
+			return;
+		}
+		xpGainedBySkill.merge(skill, deltaXp, Long::sum);
+		totalCombatXpGained += deltaXp;
 	}
 
 	public void addSupplyCostGp(long gpCost)
@@ -127,21 +232,90 @@ public final class CombatSessionTracker
 		}
 	}
 
+	public void recordNpcLootValue(String npcName, long lootGp)
+	{
+		if (lootGp <= 0 || npcName == null || npcName.trim().isEmpty())
+		{
+			return;
+		}
+		String cleanName = npcName.trim();
+		TargetSummary summary = targetSummaries.get(cleanName);
+		if (summary != null)
+		{
+			summary.addLootValueGp(lootGp);
+		}
+		for (FightRecord recent : recentFights)
+		{
+			if (cleanName.equals(recent.getNpcName()))
+			{
+				recent.setLootValueGp(recent.getLootValueGp() + lootGp);
+				break;
+			}
+		}
+	}
+
+	public void pinCurrentComparison(long supplyBurnPerHour, long netProfitPerHour)
+	{
+		SessionSnapshot s = snapshot();
+		String weapon = !s.getWeapons().isEmpty() ? s.getWeapons().get(0).getWeaponName() : currentWeaponName;
+		String label = !s.getActiveTargetName().isEmpty()
+			? (s.getActiveTargetName() + " (" + weapon + ")")
+			: weapon;
+		this.pinnedComparison = new PinnedComparison(
+			label,
+			weapon,
+			s.getActiveDps(),
+			s.getSessionDps(),
+			s.getAccuracyPercent(),
+			s.getMaxHit(),
+			s.getKillsPerHour(),
+			s.getCombatXpPerHour(),
+			supplyBurnPerHour,
+			netProfitPerHour
+		);
+	}
+
+	public void clearPinnedComparison()
+	{
+		this.pinnedComparison = null;
+	}
+
+	@Nullable
+	public PinnedComparison getPinnedComparison()
+	{
+		return pinnedComparison;
+	}
+
 	public void onGameTick(int tick)
 	{
 		this.currentTick = tick;
+		pruneRollingWindow(tick);
+
 		if (!sessionStarted || paused)
 		{
 			return;
 		}
 		sessionTicks++;
-		if ((tick - lastCombatTick) <= idleTimeoutTicks)
+
+		if (inActiveBout)
 		{
-			activeTicks++;
-			WeaponStats ws = weaponStatsById.get(currentWeaponId);
-			if (ws != null)
+			if ((tick - lastCombatTick) <= idleTimeoutTicks)
 			{
-				ws.addActiveTick();
+				if (tick > lastActiveTickCounted)
+				{
+					pendingActiveTicks++;
+					pendingWeaponTicks.merge(currentWeaponId, 1, Integer::sum);
+					lastActiveTickCounted = tick;
+				}
+				if ((tick - lastSparklineTick) >= SPARKLINE_INTERVAL_TICKS)
+				{
+					recordSparklineSample(tick);
+				}
+			}
+			else
+			{
+				// Idle timeout expired with no follow-up hit: discard dead trailing ticks from Active DPS.
+				endActiveBoutDiscardingTail();
 			}
 		}
 
@@ -171,6 +345,7 @@ public final class CombatSessionTracker
 			return;
 		}
 		this.currentTick = tick;
+		pruneRollingWindow(tick);
 
 		if (category.isStatusDamage())
 		{
@@ -180,10 +355,12 @@ public final class CombatSessionTracker
 			{
 				return;
 			}
+			int cleanStatus = Math.max(0, amount);
 			markCombatActivity(tick);
 			engaged.lastActivityTick = tick;
-			engaged.statusDamage += Math.max(0, amount);
-			statusAndDefense.recordOutgoingStatus(category, amount);
+			engaged.statusDamage += cleanStatus;
+			statusAndDefense.recordOutgoingStatus(category, cleanStatus);
+			addRollingDamage(tick, cleanStatus);
 			return;
 		}
 
@@ -202,6 +379,7 @@ public final class CombatSessionTracker
 
 		boolean isMaxSplat = category == HitCategory.DIRECT_MAX_HIT;
 		int cleanDmg = category == HitCategory.DIRECT_MISS ? 0 : Math.max(0, amount);
+		boolean isSpecHit = (tick - lastSpecUsedTick) >= 0 && (tick - lastSpecUsedTick) <= 2;
 
 		if (cleanDmg > 0)
 		{
@@ -209,15 +387,42 @@ public final class CombatSessionTracker
 			totalDirectDamage += cleanDmg;
 			fight.hitsLanded++;
 			fight.directDamage += cleanDmg;
+			fight.lastDirectDamage = cleanDmg;
 			if (cleanDmg > fight.maxHit)
 			{
 				fight.maxHit = cleanDmg;
+			}
+			currentHitStreak++;
+			currentMissStreak = 0;
+			if (currentHitStreak > bestHitStreak)
+			{
+				bestHitStreak = currentHitStreak;
+			}
+			addRollingDamage(tick, cleanDmg);
+			if (isSpecHit)
+			{
+				specHits++;
+				specTotalDamage += cleanDmg;
+				if (cleanDmg > specMaxHit)
+				{
+					specMaxHit = cleanDmg;
+				}
 			}
 		}
 		else
 		{
 			totalMisses++;
 			fight.misses++;
+			currentMissStreak++;
+			currentHitStreak = 0;
+			if (currentMissStreak > worstMissStreak)
+			{
+				worstMissStreak = currentMissStreak;
+			}
+			if (isSpecHit)
+			{
+				specMisses++;
+			}
 		}
 
 		hitDistribution.record(cleanDmg, isMaxSplat);
@@ -225,6 +430,10 @@ public final class CombatSessionTracker
 		WeaponStats weapon = weaponStatsById.computeIfAbsent(currentWeaponId,
 			id -> new WeaponStats(currentWeaponId, currentWeaponName));
 		weapon.recordHit(cleanDmg, isMaxSplat);
+		if (lastActiveTickCounted == tick && weapon.toSnapshot().getActiveTicks() == 0)
+		{
+			weapon.addActiveTick();
+		}
 		fight.damageByWeapon.merge(currentWeaponName, (long) cleanDmg, Long::sum);
 	}
 
@@ -278,12 +487,32 @@ public final class CombatSessionTracker
 		}
 		if (fight.hitsLanded == 0 && fight.misses == 0 && fight.statusDamage == 0)
 		{
+			if (activeNpcs.isEmpty())
+			{
+				endActiveBoutDiscardingTail();
+			}
 			return null;
+		}
+
+		// Commit ticks up to the kill tick, then immediately pause Active DPS if no other engaged NPCs remain.
+		flushPendingActiveTicks();
+		if (activeNpcs.isEmpty())
+		{
+			recordSparklineSample(tick);
+			inActiveBout = false;
+			pendingActiveTicks = 0;
+			pendingWeaponTicks.clear();
 		}
 
 		int durationTicks = Math.max(1, (tick - fight.firstHitTick) + 1);
 		long allocatedSupplyCost = unattributedSupplyCostGp;
 		unattributedSupplyCostGp = 0L;
+
+		if (fight.lastDirectDamage > 0)
+		{
+			totalKillingHitDamage += fight.lastDirectDamage;
+			killingHitCount++;
+		}
 
 		FightRecord record = FightRecord.builder()
 			.npcName(fight.npcName)
@@ -297,6 +526,7 @@ public final class CombatSessionTracker
 			.damageTaken(fight.damageTaken)
 			.healingReceived(fight.healingReceived)
 			.supplyCostGp(allocatedSupplyCost)
+			.killingHitDamage(fight.lastDirectDamage)
 			.primaryWeaponName(fight.getPrimaryWeaponName())
 			.completedAtEpochMs(nowEpochMs)
 			.build();
@@ -345,13 +575,35 @@ public final class CombatSessionTracker
 	{
 		sessionStarted = false;
 		paused = false;
+		inActiveBout = false;
 		activeTicks = 0;
+		pendingActiveTicks = 0;
+		pendingWeaponTicks.clear();
+		lastActiveTickCounted = -10000;
 		sessionTicks = 0;
 		lastCombatTick = -10000;
 		totalDirectDamage = 0;
 		totalHitsLanded = 0;
 		totalMisses = 0;
 		sessionKills = 0;
+		currentHitStreak = 0;
+		bestHitStreak = 0;
+		currentMissStreak = 0;
+		worstMissStreak = 0;
+		totalKillingHitDamage = 0;
+		killingHitCount = 0;
+		rollingWindow.clear();
+		rollingWindowDamage = 0;
+		dpsSparkline.clear();
+		lastSparklineTick = -10000;
+		lastSpecUsedTick = -100;
+		specUses = 0;
+		specHits = 0;
+		specMisses = 0;
+		specTotalDamage = 0;
+		specMaxHit = 0;
+		xpGainedBySkill.clear();
+		totalCombatXpGained = 0;
 		focusNpcIndex = -1;
 		lastTargetName = "";
 		lastTargetCombatLevel = 0;
@@ -372,6 +624,9 @@ public final class CombatSessionTracker
 	public SessionSnapshot snapshot()
 	{
 		StatusDamageBreakdown.Snapshot statusSnap = statusAndDefense.toSnapshot();
+		boolean activelyFighting = isInActiveCombat();
+		int effectiveActiveTicks = activeTicks + (activelyFighting && !activeNpcs.isEmpty() ? pendingActiveTicks : 0);
+
 		List<WeaponStats.Snapshot> weapons = new ArrayList<>(weaponStatsById.size());
 		for (WeaponStats ws : weaponStatsById.values())
 		{
@@ -385,11 +640,30 @@ public final class CombatSessionTracker
 		int activeFightTicks = focus != null ? Math.max(1, (currentTick - focus.firstHitTick) + 1) : 0;
 		long activeFightDamage = focus != null ? (focus.directDamage + focus.statusDamage) : 0L;
 
+		double sessionSec = sessionTicks * WeaponStats.SECONDS_PER_TICK;
+		double rollingSec = Math.min(ROLLING_WINDOW_TICKS * WeaponStats.SECONDS_PER_TICK,
+			Math.max(WeaponStats.SECONDS_PER_TICK, Math.max(effectiveActiveTicks, 1) * WeaponStats.SECONDS_PER_TICK));
+		double rolling30sDps = rollingWindowDamage > 0 ? (rollingWindowDamage / rollingSec) : 0.0;
+
+		List<SkillXpEntry> skillXp = new ArrayList<>(xpGainedBySkill.size());
+		double sessionHours = Math.max(WeaponStats.SECONDS_PER_TICK, sessionSec) / 3600.0;
+		for (Map.Entry<Skill, Long> e : xpGainedBySkill.entrySet())
+		{
+			if (e.getValue() > 0)
+			{
+				skillXp.add(new SkillXpEntry(e.getKey(), e.getValue(), sessionSec > 0 ? e.getValue() / sessionHours : 0.0));
+			}
+		}
+		skillXp.sort(Comparator.comparingLong(SkillXpEntry::getXpGained).reversed());
+
+		SpecSnapshot specSnap = new SpecSnapshot(specUses, specHits, specMisses, specTotalDamage, specMaxHit);
+		double avgKillingHit = killingHitCount > 0 ? ((double) totalKillingHitDamage) / killingHitCount : 0.0;
+
 		return new SessionSnapshot(
 			sessionStarted,
 			paused,
-			isInActiveCombat(),
-			activeTicks,
+			activelyFighting,
+			effectiveActiveTicks,
 			sessionTicks,
 			activeTargetName,
 			activeTargetLvl,
@@ -402,6 +676,15 @@ public final class CombatSessionTracker
 			hitDistribution.getMaxHit(),
 			hitDistribution.getNativeMaxSplats(),
 			sessionKills,
+			rolling30sDps,
+			bestHitStreak,
+			worstMissStreak,
+			avgKillingHit,
+			totalCombatXpGained,
+			Collections.unmodifiableList(skillXp),
+			specSnap,
+			Collections.unmodifiableList(new ArrayList<>(dpsSparkline)),
+			pinnedComparison,
 			Collections.unmodifiableList(hitDistribution.toBuckets()),
 			statusSnap,
 			Collections.unmodifiableList(weapons),
@@ -410,7 +693,7 @@ public final class CombatSessionTracker
 		);
 	}
 
-	public String formatSummaryText(long sessionSupplyCostGp, boolean showGp)
+	public String formatSummaryText(long sessionSupplyCostGp, long sessionLootGp, boolean showGp)
 	{
 		SessionSnapshot s = snapshot();
 		StringBuilder sb = new StringBuilder();
@@ -425,21 +708,35 @@ public final class CombatSessionTracker
 			sb.append('\n');
 		}
 		sb.append(String.format(Locale.US,
-			"Active DPS: %.2f (%s) | Session DPS: %.2f (%s)\n",
+			"Active DPS: %.2f (%s) | Session DPS: %.2f (%s) | 30s DPS: %.2f\n",
 			s.getActiveDps(), formatDuration(s.getActiveSeconds()),
-			s.getSessionDps(), formatDuration(s.getSessionSeconds())));
+			s.getSessionDps(), formatDuration(s.getSessionSeconds()),
+			s.getRolling30sDps()));
 		sb.append(String.format(Locale.US,
 			"Damage: %,d (Direct %,d + Status %,d) | Accuracy: %.1f%% (%d/%d) | Max Hit: %d (%d max splats)\n",
 			s.getTotalDamage(), s.getTotalDirectDamage(), s.getTotalStatusDamage(),
 			s.getAccuracyPercent(), s.getTotalHitsLanded(), s.getTotalSwings(),
 			s.getMaxHit(), s.getNativeMaxSplats()));
 		sb.append(String.format(Locale.US,
-			"Kills: %d | Damage Taken: %,d | Healed: %,d\n",
-			s.getSessionKills(), s.getStatusAndDefense().getTotalDamageTaken(),
+			"Kills: %d | Best Hit Streak: %d | Worst Miss Streak: %d | Taken: %,d | Healed: %,d\n",
+			s.getSessionKills(), s.getBestHitStreak(), s.getWorstMissStreak(),
+			s.getStatusAndDefense().getTotalDamageTaken(),
 			s.getStatusAndDefense().getHealingReceived()));
-		if (showGp && sessionSupplyCostGp > 0)
+		if (s.getTotalCombatXpGained() > 0)
 		{
-			sb.append(String.format(Locale.US, "Supply Cost: %,d gp\n", sessionSupplyCostGp));
+			sb.append(String.format(Locale.US, "Combat XP: %,d (%,.0f/hr)\n",
+				s.getTotalCombatXpGained(), s.getCombatXpPerHour()));
+		}
+		if (s.getSpec().getUses() > 0)
+		{
+			sb.append(String.format(Locale.US, "Specs: %d uses | %.1f%% acc | avg %.1f | max %d\n",
+				s.getSpec().getUses(), s.getSpec().getAccuracyPercent(),
+				s.getSpec().getAveragePerUse(), s.getSpec().getMaxHit()));
+		}
+		if (showGp && (sessionSupplyCostGp > 0 || sessionLootGp > 0))
+		{
+			sb.append(String.format(Locale.US, "Loot: %,d gp | Burn: %,d gp | Net: %,d gp\n",
+				sessionLootGp, sessionSupplyCostGp, sessionLootGp - sessionSupplyCostGp));
 		}
 		if (!s.getWeapons().isEmpty())
 		{
@@ -458,7 +755,7 @@ public final class CombatSessionTracker
 	public String formatHistoryCsv()
 	{
 		StringBuilder sb = new StringBuilder();
-		sb.append("NPC,CombatLevel,Kills,AvgKillSec,FastestKillSec,AvgDPS,AccuracyPct,MaxHit,TotalDamage,DamageTaken,SupplyCostPerKillGp\n");
+		sb.append("NPC,CombatLevel,Kills,AvgKillSec,FastestKillSec,AvgDPS,AccuracyPct,MaxHit,TotalDamage,DamageTaken,LootPerKillGp,SupplyCostPerKillGp,NetProfitPerKillGp\n");
 		for (TargetSummary t : getTargetSummariesSorted())
 		{
 			sb.append(escapeCsv(t.getNpcName())).append(',')
@@ -471,7 +768,9 @@ public final class CombatSessionTracker
 				.append(t.getMaxHit()).append(',')
 				.append(t.getTotalDamage()).append(',')
 				.append(t.getTotalDamageTaken()).append(',')
-				.append(t.getSupplyCostPerKillGp()).append('\n');
+				.append(t.getLootPerKillGp()).append(',')
+				.append(t.getSupplyCostPerKillGp()).append(',')
+				.append(t.getNetProfitPerKillGp()).append('\n');
 		}
 		return sb.toString();
 	}
@@ -507,10 +806,95 @@ public final class CombatSessionTracker
 		if (!sessionStarted)
 		{
 			sessionStarted = true;
-			activeTicks = 1;
 			sessionTicks = 1;
+			lastSparklineTick = tick;
+		}
+		if (inActiveBout)
+		{
+			flushPendingActiveTicks();
+		}
+		else
+		{
+			inActiveBout = true;
+			pendingActiveTicks = 0;
+			pendingWeaponTicks.clear();
+		}
+		if (tick > lastActiveTickCounted)
+		{
+			activeTicks++;
+			WeaponStats ws = weaponStatsById.get(currentWeaponId);
+			if (ws != null)
+			{
+				ws.addActiveTick();
+			}
+			lastActiveTickCounted = tick;
 		}
 		lastCombatTick = tick;
+	}
+
+	private void flushPendingActiveTicks()
+	{
+		if (pendingActiveTicks > 0)
+		{
+			activeTicks += pendingActiveTicks;
+			for (Map.Entry<Integer, Integer> e : pendingWeaponTicks.entrySet())
+			{
+				WeaponStats ws = weaponStatsById.get(e.getKey());
+				if (ws != null)
+				{
+					for (int i = 0; i < e.getValue(); i++)
+					{
+						ws.addActiveTick();
+					}
+				}
+			}
+			pendingActiveTicks = 0;
+			pendingWeaponTicks.clear();
+		}
+	}
+
+	private void endActiveBoutDiscardingTail()
+	{
+		inActiveBout = false;
+		pendingActiveTicks = 0;
+		pendingWeaponTicks.clear();
+	}
+
+	private void addRollingDamage(int tick, int damage)
+	{
+		if (damage <= 0)
+		{
+			return;
+		}
+		rollingWindow.addLast(new TimedDamage(tick, damage));
+		rollingWindowDamage += damage;
+	}
+
+	private void pruneRollingWindow(int tick)
+	{
+		int cutoff = tick - ROLLING_WINDOW_TICKS;
+		while (!rollingWindow.isEmpty() && rollingWindow.peekFirst().getTick() < cutoff)
+		{
+			rollingWindowDamage -= rollingWindow.removeFirst().getDamage();
+		}
+		if (rollingWindowDamage < 0)
+		{
+			rollingWindowDamage = 0;
+		}
+	}
+
+	private void recordSparklineSample(int tick)
+	{
+		lastSparklineTick = tick;
+		int effectiveTicks = Math.max(1, activeTicks + pendingActiveTicks);
+		double rollingSec = Math.min(ROLLING_WINDOW_TICKS * WeaponStats.SECONDS_PER_TICK,
+			effectiveTicks * WeaponStats.SECONDS_PER_TICK);
+		double sample = rollingWindowDamage > 0 ? (rollingWindowDamage / rollingSec) : 0.0;
+		dpsSparkline.addLast(sample);
+		while (dpsSparkline.size() > MAX_SPARKLINE_POINTS)
+		{
+			dpsSparkline.removeFirst();
+		}
 	}
 
 	@Value
@@ -532,6 +916,16 @@ public final class CombatSessionTracker
 		int maxHit;
 		int nativeMaxSplats;
 		int sessionKills;
+		double rolling30sDps;
+		int bestHitStreak;
+		int worstMissStreak;
+		double averageKillingHit;
+		long totalCombatXpGained;
+		List<SkillXpEntry> skillXp;
+		SpecSnapshot spec;
+		List<Double> dpsSparkline;
+		@Nullable
+		PinnedComparison pinnedComparison;
 		List<HitDistribution.Bucket> hitBuckets;
 		StatusDamageBreakdown.Snapshot statusAndDefense;
 		List<WeaponStats.Snapshot> weapons;
@@ -595,6 +989,16 @@ public final class CombatSessionTracker
 			}
 			double hours = Math.max(WeaponStats.SECONDS_PER_TICK, getSessionSeconds()) / 3600.0;
 			return sessionKills / hours;
+		}
+
+		public double getCombatXpPerHour()
+		{
+			if (totalCombatXpGained <= 0 || sessionTicks <= 0)
+			{
+				return 0.0;
+			}
+			double hours = Math.max(WeaponStats.SECONDS_PER_TICK, getSessionSeconds()) / 3600.0;
+			return totalCombatXpGained / hours;
 		}
 	}
 }

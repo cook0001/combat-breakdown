@@ -25,6 +25,7 @@ public class TargetSummary
 	private long totalDamageTaken;
 	private long totalHealing;
 	private long totalSupplyCostGp;
+	private long totalLootValueGp;
 	private long lastKilledEpochMs;
 
 	public void mergeFight(FightRecord fight)
@@ -59,7 +60,16 @@ public class TargetSummary
 		totalDamageTaken += fight.getDamageTaken();
 		totalHealing += fight.getHealingReceived();
 		totalSupplyCostGp += fight.getSupplyCostGp();
+		totalLootValueGp += fight.getLootValueGp();
 		lastKilledEpochMs = Math.max(lastKilledEpochMs, fight.getCompletedAtEpochMs());
+	}
+
+	public void addLootValueGp(long lootGp)
+	{
+		if (lootGp > 0)
+		{
+			totalLootValueGp += lootGp;
+		}
 	}
 
 	public long getTotalDamage()
@@ -92,5 +102,15 @@ public class TargetSummary
 	public long getSupplyCostPerKillGp()
 	{
 		return kills > 0 ? totalSupplyCostGp / kills : 0L;
+	}
+
+	public long getLootPerKillGp()
+	{
+		return kills > 0 ? totalLootValueGp / kills : 0L;
+	}
+
+	public long getNetProfitPerKillGp()
+	{
+		return kills > 0 ? (totalLootValueGp - totalSupplyCostGp) / kills : 0L;
 	}
 }

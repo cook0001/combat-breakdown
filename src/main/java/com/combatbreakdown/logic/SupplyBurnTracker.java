@@ -108,7 +108,32 @@ public final class SupplyBurnTracker
 	private final Map<Integer, Integer> recentDroppedTickByItem = new HashMap<>();
 
 	private final Map<String, SupplyUsage> usageByKey = new LinkedHashMap<>();
+	private final Map<Integer, LootItemEntry> lootByItemId = new LinkedHashMap<>();
 	private long totalCostGp;
+	private long totalLootGp;
+
+	@Value
+	public static class LootSnapshot
+	{
+		int itemId;
+		String displayName;
+		long quantity;
+		long totalValueGp;
+	}
+
+	private static final class LootItemEntry
+	{
+		final int itemId;
+		final String displayName;
+		long quantity;
+		long totalValueGp;
+
+		LootItemEntry(int itemId, String displayName)
+		{
+			this.itemId = itemId;
+			this.displayName = displayName;
+		}
+	}
 
 	public void recordConsumeAction(String menuOption, int itemId, int tick)
 	{
@@ -150,9 +175,27 @@ public final class SupplyBurnTracker
 	public void reset()
 	{
 		usageByKey.clear();
+		lootByItemId.clear();
 		totalCostGp = 0L;
+		totalLootGp = 0L;
 		recentDroppedTickByItem.clear();
 		invalidateBaseline();
+	}
+
+	public long recordLootDrop(int itemId, int quantity, ItemMetaLookup meta)
+	{
+		if (itemId <= 0 || quantity <= 0)
+		{
+			return 0L;
+		}
+		String name = cleanName(meta.getName(itemId), itemId);
+		long unitPrice = itemId == ItemID.COINS ? 1L : Math.max(0L, meta.getUnitPrice(itemId));
+		long value = unitPrice * quantity;
+		LootItemEntry entry = lootByItemId.computeIfAbsent(itemId, id -> new LootItemEntry(itemId, name));
+		entry.quantity += quantity;
+		entry.totalValueGp += value;
+		totalLootGp += value;
+		return value;
 	}
 
 	/**
@@ -481,22 +524,53 @@ public final class SupplyBurnTracker
 			.thenComparingLong(SupplyUsage.Snapshot::getUnitsConsumed).reversed());
 
 		long gpPerHour = 0L;
-		if (totalCostGp > 0 && sessionSeconds > 0)
+		long lootGpPerHour = 0L;
+		long netProfitGp = totalLootGp - totalCostGp;
+		long netProfitPerHour = 0L;
+		if (sessionSeconds > 0)
 		{
 			double hours = Math.max(WeaponStats.SECONDS_PER_TICK, sessionSeconds) / 3600.0;
-			gpPerHour = Math.round(totalCostGp / hours);
+			if (totalCostGp > 0)
+			{
+				gpPerHour = Math.round(totalCostGp / hours);
+			}
+			if (totalLootGp > 0)
+			{
+				lootGpPerHour = Math.round(totalLootGp / hours);
+			}
+			if (netProfitGp != 0L)
+			{
+				netProfitPerHour = Math.round(netProfitGp / hours);
+			}
 		}
 		long gpPerKill = kills > 0 ? totalCostGp / kills : 0L;
+		long lootPerKill = kills > 0 ? totalLootGp / kills : 0L;
+		long netPerKill = kills > 0 ? netProfitGp / kills : 0L;
+
+		List<LootSnapshot> lootItems = new ArrayList<>(lootByItemId.size());
+		for (LootItemEntry e : lootByItemId.values())
+		{
+			lootItems.add(new LootSnapshot(e.itemId, e.displayName, e.quantity, e.totalValueGp));
+		}
+		lootItems.sort(Comparator.comparingLong(LootSnapshot::getTotalValueGp).reversed()
+			.thenComparingLong(LootSnapshot::getQuantity).reversed());
 
 		return new BurnSnapshot(
 			totalCostGp,
 			gpPerHour,
 			gpPerKill,
+			totalLootGp,
+			lootGpPerHour,
+			lootPerKill,
+			netProfitGp,
+			netProfitPerHour,
+			netPerKill,
 			foodUnits,
 			potionDoses,
 			ammoUnits,
 			runeUnits,
-			Collections.unmodifiableList(items)
+			Collections.unmodifiableList(items),
+			Collections.unmodifiableList(lootItems)
 		);
 	}
 
@@ -515,15 +589,22 @@ public final class SupplyBurnTracker
 		long totalCostGp;
 		long gpPerHour;
 		long gpPerKill;
+		long totalLootGp;
+		long lootGpPerHour;
+		long lootPerKillGp;
+		long netProfitGp;
+		long netProfitPerHour;
+		long netProfitPerKillGp;
 		long foodEaten;
 		long potionDoses;
 		long ammoUsed;
 		long runesUsed;
 		List<SupplyUsage.Snapshot> items;
+		List<LootSnapshot> lootItems;
 
 		public boolean isEmpty()
 		{
-			return items.isEmpty();
+			return items.isEmpty() && lootItems.isEmpty();
 		}
 	}
 }
