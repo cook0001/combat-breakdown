@@ -47,6 +47,11 @@ public final class WeaponStats
 
 	public Snapshot toSnapshot()
 	{
+		return toSnapshot(0);
+	}
+
+	public Snapshot toSnapshot(int pendingActiveTicks)
+	{
 		return new Snapshot(
 			weaponItemId,
 			weaponName,
@@ -55,7 +60,7 @@ public final class WeaponStats
 			totalDamage,
 			maxHit,
 			nativeMaxSplats,
-			activeTicks
+			activeTicks + Math.max(0, pendingActiveTicks)
 		);
 	}
 

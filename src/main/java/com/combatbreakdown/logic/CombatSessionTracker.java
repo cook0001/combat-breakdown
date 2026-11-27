@@ -158,8 +158,10 @@ public final class CombatSessionTracker
 	private long specTotalDamage;
 	private int specMaxHit;
 
-	// Combat XP tracking
+	// Combat XP tracking (includes a short pre-hit buffer since OSRS XP drops precede hitsplats by 1-2 ticks)
 	private final Map<Skill, Long> xpGainedBySkill = new EnumMap<>(Skill.class);
+	private final Map<Skill, Long> pendingPreSessionXp = new EnumMap<>(Skill.class);
+	private int pendingPreSessionXpTick = -10000;
 	private long totalCombatXpGained;
 
 	private final HitDistribution hitDistribution = new HitDistribution();
@@ -214,9 +216,26 @@ public final class CombatSessionTracker
 		this.specUses++;
 	}
 
-	public void recordSkillXp(Skill skill, long deltaXp)
+	public void recordSkillXp(Skill skill, long deltaXp, int tick)
 	{
-		if (paused || skill == null || deltaXp <= 0 || !sessionStarted)
+		if (paused || skill == null || deltaXp <= 0)
+		{
+			return;
+		}
+		this.currentTick = tick;
+		if (!sessionStarted)
+		{
+			// Buffer up to 5 ticks so the first attack's XP drop (which fires before the hitsplat) is never lost.
+			if ((tick - pendingPreSessionXpTick) > 5)
+			{
+				pendingPreSessionXp.clear();
+			}
+			pendingPreSessionXpTick = tick;
+			pendingPreSessionXp.merge(skill, deltaXp, Long::sum);
+			return;
+		}
+		// Require recent combat activity so out-of-combat teleports/alchs do not inflate Combat XP/hr.
+		if (!inActiveBout && (tick - lastCombatTick) > 6)
 		{
 			return;
 		}
@@ -493,6 +512,11 @@ public final class CombatSessionTracker
 			}
 			return null;
 		}
+		// Ignore deaths of NPCs the player abandoned long ago (e.g. finished off later by another player).
+		if ((tick - fight.lastActivityTick) > Math.max(idleTimeoutTicks + 5, 20))
+		{
+			return null;
+		}
 
 		// Commit ticks up to the kill tick, then immediately pause Active DPS if no other engaged NPCs remain.
 		flushPendingActiveTicks();
@@ -504,7 +528,8 @@ public final class CombatSessionTracker
 			pendingWeaponTicks.clear();
 		}
 
-		int durationTicks = Math.max(1, (tick - fight.firstHitTick) + 1);
+		int effectiveEndTick = Math.min(tick, fight.lastActivityTick + 4);
+		int durationTicks = Math.max(1, (effectiveEndTick - fight.firstHitTick) + 1);
 		long allocatedSupplyCost = unattributedSupplyCostGp;
 		unattributedSupplyCostGp = 0L;
 
@@ -603,6 +628,8 @@ public final class CombatSessionTracker
 		specTotalDamage = 0;
 		specMaxHit = 0;
 		xpGainedBySkill.clear();
+		pendingPreSessionXp.clear();
+		pendingPreSessionXpTick = -10000;
 		totalCombatXpGained = 0;
 		focusNpcIndex = -1;
 		lastTargetName = "";
@@ -625,12 +652,14 @@ public final class CombatSessionTracker
 	{
 		StatusDamageBreakdown.Snapshot statusSnap = statusAndDefense.toSnapshot();
 		boolean activelyFighting = isInActiveCombat();
-		int effectiveActiveTicks = activeTicks + (activelyFighting && !activeNpcs.isEmpty() ? pendingActiveTicks : 0);
+		boolean includePending = activelyFighting && !activeNpcs.isEmpty();
+		int effectiveActiveTicks = activeTicks + (includePending ? pendingActiveTicks : 0);
 
 		List<WeaponStats.Snapshot> weapons = new ArrayList<>(weaponStatsById.size());
-		for (WeaponStats ws : weaponStatsById.values())
+		for (Map.Entry<Integer, WeaponStats> entry : weaponStatsById.entrySet())
 		{
-			weapons.add(ws.toSnapshot());
+			int extra = includePending ? pendingWeaponTicks.getOrDefault(entry.getKey(), 0) : 0;
+			weapons.add(entry.getValue().toSnapshot(extra));
 		}
 		weapons.sort(Comparator.comparingLong(WeaponStats.Snapshot::getTotalDamage).reversed());
 
@@ -808,6 +837,15 @@ public final class CombatSessionTracker
 			sessionStarted = true;
 			sessionTicks = 1;
 			lastSparklineTick = tick;
+			if (!pendingPreSessionXp.isEmpty() && (tick - pendingPreSessionXpTick) <= 5)
+			{
+				for (Map.Entry<Skill, Long> entry : pendingPreSessionXp.entrySet())
+				{
+					xpGainedBySkill.merge(entry.getKey(), entry.getValue(), Long::sum);
+					totalCombatXpGained += entry.getValue();
+				}
+			}
+			pendingPreSessionXp.clear();
 		}
 		if (inActiveBout)
 		{

@@ -73,8 +73,8 @@ public class CombatSessionTrackerTest
 		tracker.updateEquippedWeapon(ItemID.OSMUMTENS_FANG, "Osmumten's fang");
 		tracker.recordSpecialAttackUsed(104);
 		tracker.onOutgoingHitsplat(42, "Vorkath", 732, HitCategory.DIRECT_MAX_HIT, 48, 104);
-		tracker.recordSkillXp(Skill.STRENGTH, 288);
-		tracker.recordSkillXp(Skill.HITPOINTS, 96);
+		tracker.recordSkillXp(Skill.STRENGTH, 288, 104);
+		tracker.recordSkillXp(Skill.HITPOINTS, 96, 104);
 		tracker.onGameTick(104);
 		tracker.addSupplyCostGp(12_500L);
 
@@ -190,6 +190,34 @@ public class CombatSessionTrackerTest
 		assertFalse(snap.isInActiveCombat());
 		assertEquals("Idle ticks after disengaging without a kill must not inflate activeTicks", 1, snap.getActiveTicks());
 		assertTrue("Session ticks must continue counting continuously", snap.getSessionTicks() >= 15);
+	}
+
+	@Test
+	public void capturesPreHitsplatFirstAttackXpAndIgnoresAbandonedDeathsAndAlchs()
+	{
+		CombatSessionTracker tracker = new CombatSessionTracker();
+		tracker.setIdleTimeoutTicks(5);
+		tracker.updateEquippedWeapon(ItemID.ABYSSAL_WHIP, "Abyssal whip");
+
+		// XP drop arrives 1 tick BEFORE first hitsplat (standard OSRS behavior)
+		tracker.recordSkillXp(Skill.ATTACK, 80, 50);
+		tracker.recordSkillXp(Skill.HITPOINTS, 26, 50);
+		assertFalse("XP alone should not start a combat session before a hitsplat", tracker.snapshot().isSessionStarted());
+
+		// First hitsplat lands at tick 51 -> buffered pre-session XP must flush in
+		tracker.onOutgoingHitsplat(12, "Abyssal demon", 124, HitCategory.DIRECT_HIT, 20, 51);
+		assertEquals(106L, tracker.snapshot().getTotalCombatXpGained());
+
+		// Advance 30 idle ticks so combat ends, then cast High Alch (Magic XP) and have NPC #12 die to someone else
+		for (int t = 52; t <= 82; t++)
+		{
+			tracker.onGameTick(t);
+		}
+		tracker.recordSkillXp(Skill.MAGIC, 65, 82);
+		assertEquals("Out-of-combat High Alch Magic XP must not inflate Combat XP",
+			106L, tracker.snapshot().getTotalCombatXpGained());
+		assertEquals("Abandoned NPC dying 30+ ticks later must not record a fake kill",
+			null, tracker.onNpcDeath(12, 82, 1_700_000_000_000L));
 	}
 
 	@Test

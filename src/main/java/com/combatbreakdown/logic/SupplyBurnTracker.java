@@ -426,7 +426,10 @@ public final class SupplyBurnTracker
 			&& !lower.contains("sceptre")
 			&& !lower.contains("sack")
 			&& !lower.contains("basket")
-			&& !lower.contains("fungicide");
+			&& !lower.contains("fungicide")
+			&& !lower.contains("lyre")
+			&& !lower.contains("camulet")
+			&& !lower.contains("pouch");
 	}
 
 	private void recordUsage(

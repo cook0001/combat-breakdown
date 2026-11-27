@@ -291,12 +291,13 @@ public class CombatBreakdownPlugin extends Plugin
 			return;
 		}
 		int newXp = event.getXp();
+		int tick = client.getTickCount();
 		synchronized (this)
 		{
 			Integer prev = lastSkillXp.put(skill, newXp);
 			if (prev != null && newXp > prev)
 			{
-				sessionTracker.recordSkillXp(skill, newXp - prev);
+				sessionTracker.recordSkillXp(skill, newXp - prev, tick);
 				panelDirty = true;
 			}
 		}
@@ -312,6 +313,10 @@ public class CombatBreakdownPlugin extends Plugin
 		long totalDropGp = 0L;
 		synchronized (this)
 		{
+			if (sessionTracker.isPaused())
+			{
+				return;
+			}
 			for (ItemStack stack : event.getItems())
 			{
 				if (stack == null || stack.getId() <= 0 || stack.getQuantity() <= 0)
